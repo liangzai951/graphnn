@@ -1,0 +1,23 @@
+run /home/walterms/traffic/graphnn/veldata/secondring_t1.0v1.0l10
+outpath /home/walterms/traffic/graphnn/nn_inputs/
+node_mindist 0.5
+node_maxdist 2.0
+maxnbr 8
+nTG 144
+n_drivers 189515
+n_points 148895
+source /home/walterms/traffic/OUT0_FiveRing150buffer
+tcutoff 1.0
+tglen 10
+velmin 1.0
+xmax 9917.536394009594
+xmin 9907.536393994667
+ymax 4443.059767877288
+ymin 4431.059767877795
+n_nodes 11
+n_edges 3
+nvel 1000
+Number of vel points0
+node feature header: [ncar, v_avg, v_std]
+edge feature header: [ncar_out, v_avg_out, v_std_out, ncar_in, v_avg_in, v_std_in]
+global feature header: [day, tg]
