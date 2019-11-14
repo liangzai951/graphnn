@@ -319,8 +319,8 @@ def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
             if n_nbr == maxnbr: break
         df.at[idx,"nbrs"] = nbrs
 
-    # Update eachother nbr lists
-    df = df.apply(lambda y: np.nan if len(y)==0 else y)
+    # Update eachother's nbr lists
+    df["nbrs"] = df.apply(lambda x: np.nan if len(x)==0 else x, axis=1)
     g_nbrlist = comm.gather(df[["nbrs"]],root=0)
     df_ = None
     if rank==0:
