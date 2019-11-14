@@ -27,7 +27,7 @@ runname = ""
 runpath = "/home/walterms/traffic/graphnn/veldata/"
 outpath = "/home/walterms/traffic/graphnn/nn_inputs/"
 
-node_mindist = 0.5
+node_mindist = 0.05 # nodes closer than this will be eliminated for redundancy
 node_maxdist = 2.0
 maxnbr = 8
 nvel = None
@@ -93,6 +93,8 @@ region_gsi = [xmin,xmax,ymin,ymax]
 nodes, edges = gt.generate_nodes(region=region_gsi, mindist=node_mindist, 
     maxdist=node_maxdist, maxnbr=maxnbr, disable_tqdm=disable_tqdm)
 
+if mpirank==0:
+    print(edges.sum(axis=0))
 tnode_ = time.time()
 stdout("Done nodes and edges: "+str(tnode_ - tnode)+" seconds", mpirank)
 
@@ -117,22 +119,19 @@ if f5vel.attrs["nvel"] != info["n_points"]:
 # Use f5 nvel is not specified
 if not nvel:
     nvel = f5vel.attrs["nvel"]
-
-vdset = f5vel["veldat"]
 if mpirank==0:
     info_out.write("nvel "+str(nvel)+"\n")
 
-# Getting shape doesn't load to mem
-#assert nvel == vdset.shape[0]
 nvel_per = nvel//mpisize
 vstart, vend = nvel_per*mpirank, nvel_per*(mpirank+1)
 remainder = nvel%mpisize
-
+if mpirank == (mpisize-1): 
+    vend += remainder
+    nvel_per += remainder
+    
 # Divide up the dataset
-if mpirank == (mpisize-1):
-    vdata_np = vdset[vstart:vend+remainder]
-else:
-    vdata_np = vdset[vstart:vend]
+vdset = f5vel["veldat"]
+vdata_np = vdset[vstart:vend]
 stdout("With "+str(mpisize)+" processors, nvel_per = "+str(nvel_per)+\
     ", with remainder "+str(remainder),mpirank)
 
@@ -141,17 +140,16 @@ f5vel.close()
 del vdset
 
 # We can append all the vdfs after using comm.gather which creates a list
-vdf = pd.DataFrame(columns=["day","tg","x_km","y_km","vx","vy","v","nodeID","dist2node","angle"])
-gt.build_vdf(vdata_np,nodes,vdf,days=[],nTG=info["nTG"], nvel=nvel, disable_tqdm=disable_tqdm)
+vdf = gt.build_vdf(vdata_np, nodes, nTG=info["nTG"], nvel=nvel_per, disable_tqdm=disable_tqdm)
+
+# Sometimes a stationary car will take up a lot of points
 vdf.drop_duplicates(inplace=True)
-mpicomm.Barrier()
 vdflist = mpicomm.gather(vdf,root=0)
 if mpirank==0:
     vdf = vdf.append(vdflist[1:], ignore_index=True)
     tvdf_ = time.time()
-del vdflist
+del vdflist, vdata_np
 # Perhaps I should broadcast vdf?...what if it's very big...
-print("Done: rank",mpirank)
 vdf = mpicomm.bcast(vdf, root=0)
 
 if mpirank==0:
@@ -183,28 +181,37 @@ h5out.atomic = True
 h5out.create_group("glbl_features")
 h5out.create_group("node_features")
 h5out.create_group("edge_features")
+
+np_send = edges['sender'].values.copy().astype(np.int)
+np_rece = edges['receiver'].values.copy().astype(np.int)
+h5_send = h5out.create_dataset("senders", np_send.shape, dtype=np.int)
+h5_rece = h5out.create_dataset("receivers", np_rece.shape, dtype=np.int)
 if mpirank==0:
-    np_send = edges['sender'].values.copy().astype(np.int)
-    np_rece = edges['receiver'].values.copy().astype(np.int)
-    h5out.create_dataset("senders", data=np_send, dtype=np.int)
-    h5out.create_dataset("receivers", data=np_rece, dtype=np.int)
+    h5_send[:] = np_send
+    h5_rece[:] = np_rece
 
-if False:
-    h5store = pd.HDFStore(outpath+runname+".hdf5", 'w', driver='mpio', comm=mpicomm)
-    h5store.put("senders", edges["sender"].astype(np.int), format='fixed')
-    h5store.put("receivers", edges["receiver"].astype(np.int), format='fixed')
-
-tloop_start = time.time()
-bcheck_velloop = False
-bcheck_snaploop = False
+# Create datasets for each day.tg
+# Use ABC for shapes
+A = nodes[["ncar","v_avg","v_std"]].values.copy()
+B = edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]].values.copy()
+C = np.array([[0,0]], dtype=np.int)
+for day in range(7):
+    for tg in range(info["nTG"]):
+        h5out.create_dataset("node_features/day"+str(day)+"tg"+str(tg),
+                    A.shape, dtype=np.float)
+        h5out.create_dataset("edge_features/day"+str(day)+"tg"+str(tg),
+                    B.shape, dtype=np.float)
+        h5out.create_dataset("glbl_features/day"+str(day)+"tg"+str(tg),\
+                    C.shape, dtype=np.int)
+del A,B,C
 
 stdout("Beginning feature construction loop", mpirank)
-# Certain parts of the loop aren't great for parallelization
-# e.g. nodes.at[idx,'ncar'] etc.
-# There is substantial modding of the nodes and edges dicts here
-# We should try to parallelize as many loops as possible
-for day in trange(7, desc='Days     ', disable=disable_tqdm):
-    for tg in trange(info["nTG"], desc='TimeGroup', disable=disable_tqdm):
+mydays = np.arange(mpirank,mpirank+1,dtype=np.int)
+mytgs = np.arange(info["nTG"])
+tloop_start = time.time()
+for day in trange(mydays[0],mydays[-1]+1, desc='Days     ', disable=disable_tqdm):
+    dayloop_start = time.time()
+    for tg in trange(mytgs[0],mytgs[-1]+1, desc='TimeGroup', disable=disable_tqdm):
         # Get velstats for this day, tg
         vdf_ = vdf[(vdf['day']==day) & (vdf['tg']==tg)]
         for idx, node in nodes.iterrows():
@@ -240,50 +247,36 @@ for day in trange(7, desc='Days     ', disable=disable_tqdm):
                     edges.at[eidx, "v_std_in"] = v_std_in
                     
         # Add to arrays
-        isnap = (day*info["nTG"]) + tg
-        if False:
-            h5store.put("node_features/day"+str(day)+"tg"+str(tg),
-                        nodes[["ncar","v_avg","v_std"]], 
-                        format='fixed')
-            h5store.put("edge_features/day"+str(day)+"tg"+str(tg),
-                        edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]], 
-                        format='fixed')
-            h5store.put("glbl_features/day"+str(day)+"tg"+str(tg),
-                        pd.DataFrame([[day,tg]],columns=["day","tg"],dtype=np.float), 
-                        format='fixed')
-
-        else:
-            A = nodes[["ncar","v_avg","v_std"]].values.copy()
-            B = edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]].values.copy()
-            h5_A = h5out.create_dataset("node_features/day"+str(day)+"tg"+str(tg),
-                        A.shape, dtype=np.float)
-            h5_A = A[:]
-                    
-            h5out.create_dataset("edge_features/day"+str(day)+"tg"+str(tg),\
-                        edges[["ncar_out","v_avg_out","v_std_out","ncar_in",\
-                        "v_avg_in","v_std_in"]].values.copy())
-            h5out.create_dataset("glbl_features/day"+str(day)+"tg"+str(tg),\
-                        np.array([[day,tg]],dtype=np.int))
+        A = nodes[["ncar","v_avg","v_std"]].values.copy()
+        B = edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]].values.copy()
+        C = np.array([[day,tg]], dtype=np.int)
+        h5_A = h5out["node_features/day"+str(day)+"tg"+str(tg)]
+        h5_B = h5out["edge_features/day"+str(day)+"tg"+str(tg)]
+        h5_C = h5out["glbl_features/day"+str(day)+"tg"+str(tg)]
+        h5_A[:] = A[:]
+        h5_B[:] = B[:]
+        h5_C[:] = C[:]
 
 
     if disable_tqdm:
-        daytime = time.time()
-        stdout("Day "+str(day)+" in "+str(daytime-tloop_start), mpirank)
-        tloop_start = time.time()
+        dayloop_end = time.time()
+        stdout("Day "+str(day)+" in "+str(dayloop_end - dayloop_start))
+        dyaloop_start = time.time()
         
+
+sys.stdout.flush()
 mpicomm.Barrier()
-if mpirank==0:
-    h5store.close()
 
 global_end = time.time()
 if mpirank == 0:
-    stdout("Total time for main loop: "+str(global_end - tloop_start)+" s", mpirank)
+    stdout("\nTotal time for main loop: "+str(global_end - tloop_start)+" s", mpirank)
     info_out.write("Total time for main loop: "+str(global_end - tloop_start)+" s"+"\n")
     stdout("Total time for graphsnapper: "+str(time.time() - global_start)+" s", mpirank)
     info_out.write("Total time for graphsnapper: "+str(global_end - tloop_start)+" s"+"\n")
     info_out.close()
 
+h5out.close()
 
-gt.MPI.Finalize()
-
+mpicomm.Barrier()
+gt.finalize_mpi()
 
