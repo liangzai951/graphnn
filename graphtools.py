@@ -164,7 +164,7 @@ def generate_nodes(fname="./hwy_pts.csv",
     # Reorder by index
     df.sort_index(inplace=True)
     tn2 = time.time()
-    stdout("Done. "+str(tn2-tn1)+" seconds",rank)
+    stdout("Linked neighbours in "+str(tn2-tn1)+" seconds",rank)
 
     # Let's re-index the nodes
     rekey = {}
@@ -192,7 +192,7 @@ def generate_nodes(fname="./hwy_pts.csv",
     if rank == (size-1): nend += remainder
     print("rank",rank,"\n",df[:5].to_string())
         
-    nstart, nend = 0, nnode
+    # First we do out initial edge making with the maxnbr restriction
     for key,node in tqdm(df[nstart:nend].iterrows(), disable=kwargs["disable_tqdm"]):
         for nbr in node['nbrs']:
             # Get theta in [-pi,pi] radians
@@ -203,6 +203,22 @@ def generate_nodes(fname="./hwy_pts.csv",
                 "angle": theta
             }], ignore_index=True)
 
+    stdout("Finished the initial edgemaking limited by maxnbr "+str(kwargs["maxnbr"]),rank)
+    stdout("Rank "+str(rank)+": "+str(len(edges.index))+" edges")
+    stdout("Patching up the one-way edges to create two-ways...",rank)
+    # Now we patch up the one-way connections that were missed from the maxnbr restriction
+    # The edges df is unique to each process, so iterate the whole lot
+    for idx,edge in tqdm(edges.iterrows(), disable=kwargs["disable_tqdm"]):
+        # Grab a sender and see if it appears as a receiver to each of its
+        # own receivers. If not, add it
+        s,r,th = edge['sender'], edge['receiver'], edge['angle']
+        r_receivers = edges.loc[edges['sender']==r, 'receiver'].values
+        if s not in r_receivers:
+            th_ = (th+np.pi) if th<0 else (th-np.pi)
+            edges = edges.append({'sender': r, 'receiver': s, 'angle': th_}, ignore_index=True)
+        
+    
+
     comm.Barrier()
     # Combine edge dfs
     print(edges.sum(axis=0))
@@ -211,28 +227,35 @@ def generate_nodes(fname="./hwy_pts.csv",
         edges = edges.append(edges_dflist[1:], ignore_index=True)
     del edges_dflist
     edges = comm.bcast(edges,root=0)
+    print(edges.sum(axis=0))
 
     return df, edges
 
 
 def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
+    '''
+    This function has two main stages
+    First it finds which nodes are too close together (the nearnbrs loop)
+    It finds these and compiles the list using gather and then removes nodes
+    Then it does the same loop again but for the real nbrs up to maxnbr
+    '''
     # Create km coords
     if "coords_km" not in df.columns:
         df["coords_km"] = df.apply(lambda x: coord2km(x['coords']), axis=1)
 
     # Create edgeref column
     if "nbrs" not in df.columns:
-        df["nbrs"] = ""
+        df["nbrs"] = [[] for _ in df.index]
 
-    df['z'] = ""
     # Create nearnbrs column for redundancy removal
     # Also, by adding how many neighbours we can
     # sort by num nearnbrs to optimize which nodes
     # get deleted. A node with many neighbours should
     # kill the neighbours because this node is a good approx
     # for all of them
-    df["nearnbrs"] = ""
-    df["n_nearnbrs"] = np.nan
+    df["nearnbrs"] = [[] for _ in df.index]
+    df["n_nearnbrs"] = 0
+    df['z'] = 0.
 
     nnode = len(df.index)
     nnode_per = nnode//size
@@ -240,7 +263,6 @@ def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
     nstart, nend = rank*nnode_per, (rank+1)*nnode_per
     if rank == (size-1):
         nend += remainder
-    nstart, nend = 0, nnode
     for idx,node in df[nstart:nend].iterrows():
         df['z'] = dist_from(node['coords_km'], np.asarray(df['coords_km'].tolist()))
         df.sort_values(by=['z'], inplace=True)
@@ -251,38 +273,38 @@ def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
                 nearnbrs.append(j)
             else:
                 break
-        n = len(nearnbrs)
+        n=len(nearnbrs)
         if n > 0:
             df.at[idx,"nearnbrs"] = list(nearnbrs)
             df.at[idx,"n_nearnbrs"] = n
 
-    # Need nans for the update call
-    df.sort_values(by=["n_nearnbrs"],inplace=True,ascending=True)
-    df.replace(r'', np.nan, regex=True, inplace=True)
-    # Add a barrier here
-
-    comm.Barrier()
 
     # Each node has a nearnbr list
     # Sort by n_nearnbr and remove nodes
     # You need to combine all the nearnbr lists
     # and then broadcast the compiled list
     # then each processor delete the rows in their (to-be-)identical dfs
+    df.sort_index(inplace=True)
     g_nbrlist = comm.gather(df[["nearnbrs","n_nearnbrs"]],root=0)
     df_ = None
     if rank==0:
         df_ = g_nbrlist[0].copy()
         for d in g_nbrlist[1:]:
-            df_.update(d)
+            # Assert there is no overlap
+            assert df_[d['n_nearnbrs']>0].sum(axis=0)['n_nearnbrs'] == 0
+            df_.loc[d["n_nearnbrs"]>0,['nearnbrs','n_nearnbrs']] = d[['nearnbrs','n_nearnbrs']]
+        # Assert we have no nans
+        assert df_.isna().sum().sum() == 0
     df_ = comm.bcast(df_,root=0)
-    df.update(df_)
+    df.loc[df_["n_nearnbrs"]>0,['nearnbrs','n_nearnbrs']] = df_[['nearnbrs','n_nearnbrs']]
 
     # Want to find nodes with the most neighbours and elimate said nbrs
     # (If only it were that easy)
-    df.replace({"n_nearnbrs": np.nan}, 0, inplace=True)
     df.sort_values(by=["n_nearnbrs"],inplace=True, ascending=False)
 
-    # Remove neighbours
+    # Remove redundant neighbours
+    stdout("Deleting nearnbrs...",rank)
+    pre_nnode = nnode
     for lbl,row in df.iterrows():
         if row["n_nearnbrs"] < 1: break
         if row["n_nearnbrs"] == 1:
@@ -294,10 +316,11 @@ def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
         else:
             removes = list(set(list(row["nearnbrs"])) & set(df.index))
         df.drop(removes, inplace=True)
+    post_nnode = len(df.index)
+    stdout("Removed "+str(pre_nnode-post_nnode)+" redundant nbrs",rank)
 
-    comm.Barrier()
     df.drop(columns=['n_nearnbrs','nearnbrs'],inplace=True)
-    stdout("Connecting nbrs...", rank)
+    stdout("Connecting final nbrs...", rank)
     nnode = len(df.index)
     nnode_per = nnode//size
     remainder = nnode%size
@@ -305,6 +328,7 @@ def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
     if rank == (size-1):
         nend += remainder
     # Fill the 'nbrs' col of df 
+    df['n_nbrs'] = 0
     for idx,node in tqdm(df[nstart:nend].iterrows(), disable=kwargs["disable_tqdm"]):
         # Populate 'z' column
         df['z'] = dist_from(node['coords_km'], np.asarray(df['coords_km'].tolist()))
@@ -317,21 +341,24 @@ def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
                 n_nbr+=1
             else: break
             if n_nbr == maxnbr: break
-        df.at[idx,"nbrs"] = nbrs
+        df.at[idx,"nbrs"] = list(nbrs)
+        df.at[idx,"n_nbrs"] = n_nbr
 
     # Update eachother's nbr lists
-    df["nbrs"] = df.apply(lambda x: np.nan if len(x)==0 else x, axis=1)
-    g_nbrlist = comm.gather(df[["nbrs"]],root=0)
+    g_nbrlist = comm.gather(df[["n_nbrs","nbrs"]],root=0)
     df_ = None
     if rank==0:
         df_ = g_nbrlist[0].copy()
         for d in g_nbrlist[1:]:
-            df_.update(d)
+            assert df_[d['n_nbrs']>0].sum(axis=0)['n_nbrs'] == 0
+            df_.loc[d['n_nbrs']>0,['n_nbrs','nbrs']] = d[['n_nbrs','nbrs']]
+        # Assert we have no nans
+        assert df_.isna().sum().sum() == 0
     df_ = comm.bcast(df_,root=0)
-    df.update(df_)
+    df.loc[df_["n_nbrs"]>0,['nbrs','n_nbrs']] = df_[['nbrs','n_nbrs']]
 
-    # Remove z
-    df.drop(columns='z',inplace=True)
+    # Remove z and n_nbrs
+    df.drop(columns=['z','n_nbrs'],inplace=True)
     return
     
         
