@@ -124,10 +124,10 @@ def build_vdf(data_np, nodedf, days=[], tgs=[], nTG=None, nvel=None, node4vel_ra
                 "angle": angle
             }], ignore_index=True)
 
-            vi+=1
-            if nvel and vi >= nvel: break
+        vi+=1
         if nvel and vi >= nvel: break
 
+    vdf.drop_duplicates(inplace=True)
     return vdf
 
 
@@ -158,7 +158,7 @@ def generate_nodes(fname="./hwy_pts.csv",
     df["coords_km"] = df.apply(lambda x: coord2km(x["coords"]), axis=1)
     
     # Link neighbours and drop redundant nodes
-    stdout("\nLinking neighbours...", rank)
+    stdout("Linking neighbours...", rank)
     tn1 = time.time()
     link_neighbours(df,mindist=mindist, **kwargs)
     # Reorder by index
@@ -190,7 +190,6 @@ def generate_nodes(fname="./hwy_pts.csv",
     remainder = nnode%size
     nstart, nend = rank*nnode_per, (rank+1)*nnode_per
     if rank == (size-1): nend += remainder
-    print("rank",rank,"\n",df[:5].to_string())
         
     # First we do out initial edge making with the maxnbr restriction
     for key,node in tqdm(df[nstart:nend].iterrows(), disable=kwargs["disable_tqdm"]):
@@ -204,7 +203,14 @@ def generate_nodes(fname="./hwy_pts.csv",
             }], ignore_index=True)
 
     stdout("Finished the initial edgemaking limited by maxnbr "+str(kwargs["maxnbr"]),rank)
-    stdout("Rank "+str(rank)+": "+str(len(edges.index))+" edges")
+    # Combine edge dfs
+    edges_dflist = comm.gather(edges,root=0)
+    if rank==0:
+        edges = edges.append(edges_dflist[1:], ignore_index=True)
+    del edges_dflist
+    edges.drop_duplicates(inplace=True)
+    edges = comm.bcast(edges,root=0)
+
     stdout("Patching up the one-way edges to create two-ways...",rank)
     # Now we patch up the one-way connections that were missed from the maxnbr restriction
     # The edges df is unique to each process, so iterate the whole lot
@@ -217,18 +223,6 @@ def generate_nodes(fname="./hwy_pts.csv",
             th_ = (th+np.pi) if th<0 else (th-np.pi)
             edges = edges.append({'sender': r, 'receiver': s, 'angle': th_}, ignore_index=True)
         
-    
-
-    comm.Barrier()
-    # Combine edge dfs
-    print(edges.sum(axis=0))
-    edges_dflist = comm.gather(edges,root=0)
-    if rank==0:
-        edges = edges.append(edges_dflist[1:], ignore_index=True)
-    del edges_dflist
-    edges = comm.bcast(edges,root=0)
-    print(edges.sum(axis=0))
-
     return df, edges
 
 
@@ -350,7 +344,7 @@ def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
     if rank==0:
         df_ = g_nbrlist[0].copy()
         for d in g_nbrlist[1:]:
-            assert df_[d['n_nbrs']>0].sum(axis=0)['n_nbrs'] == 0
+            assert df_.loc[d['n_nbrs']>0].sum(axis=0)['n_nbrs'] == 0
             df_.loc[d['n_nbrs']>0,['n_nbrs','nbrs']] = d[['n_nbrs','nbrs']]
         # Assert we have no nans
         assert df_.isna().sum().sum() == 0

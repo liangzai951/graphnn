@@ -89,12 +89,11 @@ tnode = time.time()
 xmin,xmax = info["xmin"]/gt.long2km, info["xmax"]/gt.long2km
 ymin,ymax = info["ymin"]/gt.lat2km, info["ymax"]/gt.lat2km
 region_gsi = [xmin,xmax,ymin,ymax]
+nTG = info["nTG"]
 
 nodes, edges = gt.generate_nodes(region=region_gsi, mindist=node_mindist, 
     maxdist=node_maxdist, maxnbr=maxnbr, disable_tqdm=disable_tqdm)
 
-if mpirank==0:
-    print(edges.sum(axis=0))
 tnode_ = time.time()
 stdout("Done nodes and edges: "+str(tnode_ - tnode)+" seconds", mpirank)
 
@@ -132,18 +131,15 @@ if mpirank == (mpisize-1):
 # Divide up the dataset
 vdset = f5vel["veldat"]
 vdata_np = vdset[vstart:vend]
-stdout("With "+str(mpisize)+" processors, nvel_per = "+str(nvel_per)+\
-    ", with remainder "+str(remainder),mpirank)
 
 # I think we can close f5vel now
 f5vel.close()
 del vdset
 
 # We can append all the vdfs after using comm.gather which creates a list
-vdf = gt.build_vdf(vdata_np, nodes, nTG=info["nTG"], nvel=nvel_per, disable_tqdm=disable_tqdm)
+vdf = gt.build_vdf(vdata_np, nodes, nTG=nTG, nvel=nvel_per, disable_tqdm=disable_tqdm)
 
 # Sometimes a stationary car will take up a lot of points
-vdf.drop_duplicates(inplace=True)
 vdflist = mpicomm.gather(vdf,root=0)
 if mpirank==0:
     vdf = vdf.append(vdflist[1:], ignore_index=True)
@@ -157,23 +153,26 @@ if mpirank==0:
     stdout("Number of vel points "+str(len(vdf.index)), mpirank)
     info_out.write("Number of vel points"+str(len(vdf.index))+"\n")
 
-nodes["ncar"] = 0
-nodes["v_avg"] = 0.
-nodes["v_std"] = 0.
 
-edges["ncar_out"] = 0
-edges["ncar_in"] = 0
-edges["v_avg_out"] = 0.
-edges["v_avg_in"] = 0.
-edges["v_std_out"] = 0.
-edges["v_std_in"] = 0.
+def zero_velstats(node_df,edge_df):
+    node_df["ncar"] = 0.
+    node_df["v_avg"] = 0.
+    node_df["v_std"] = 0.
+    edge_df["ncar_out"] = 0.
+    edge_df["ncar_in"] = 0.
+    edge_df["v_avg_out"] = 0.
+    edge_df["v_avg_in"] = 0.
+    edge_df["v_std_out"] = 0.
+    edge_df["v_std_in"] = 0.
+
+zero_velstats(nodes,edges)
 
 if mpirank==0: 
     info_out.write("node feature header: [ncar, v_avg, v_std]"+"\n")
     info_out.write("edge feature header: [ncar_out, v_avg_out, v_std_out, ncar_in, v_avg_in, v_std_in]"+"\n")
     info_out.write("global feature header: [day, tg]"+"\n")
 
-nsnap = 7*info["nTG"]
+nsnap = 7*nTG
 
 # Make output hdf5 file
 h5out = h5py.File(outpath+runname+".hdf5", 'w', driver="mpio", comm=mpicomm) 
@@ -196,7 +195,7 @@ A = nodes[["ncar","v_avg","v_std"]].values.copy()
 B = edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]].values.copy()
 C = np.array([[0,0]], dtype=np.int)
 for day in range(7):
-    for tg in range(info["nTG"]):
+    for tg in range(nTG):
         h5out.create_dataset("node_features/day"+str(day)+"tg"+str(tg),
                     A.shape, dtype=np.float)
         h5out.create_dataset("edge_features/day"+str(day)+"tg"+str(tg),
@@ -205,29 +204,66 @@ for day in range(7):
                     C.shape, dtype=np.int)
 del A,B,C
 
-stdout("Beginning feature construction loop", mpirank)
-mydays = np.arange(mpirank,mpirank+1,dtype=np.int)
-mytgs = np.arange(info["nTG"])
+# Need to figure out how to divy up the processors
+# accross the days and tgs
+mydays, mytgs, subrank  = None, None, None
+if mpisize < 7:
+    day_per_proc = 7//mpisize
+    rem_day = 7%mpisize
+    mydays = np.arange(mpirank*day_per_proc, (mpirank+1)*day_per_proc,dtype=np.int)
+    if mpirank == (mpisize-1):
+        mydays = np.append(mydays,np.arange(7-rem_day,7))
+    mytgs = np.arange(info["nTG"])
+    subrank = mpirank
+else:
+    np_per_daygroup = mpisize//7
+    np_remainder = mpisize%7
+    # Should distribute the remainder processes as thin as possible
+    # So add one for each daygroup < remainder
+    daygroup = mpirank%7
+    if daygroup < np_remainder:
+        np_per_daygroup += 1
+    mydays = [mpirank%7]
+    # Now divide up ntg for each group
+    ntg_per = nTG // np_per_daygroup
+    tg_remainder = nTG%np_per_daygroup
+    subrank = mpirank//7
+    tgstart, tgend = subrank*ntg_per, (subrank+1)*ntg_per
+    if subrank==6:
+        tgend += tg_remainder
+    mytgs = np.arange(tgstart,tgend)
+
+
+stdout("Performing main feature construction loop", mpirank)
 tloop_start = time.time()
+bdiag = False
+tg_diag = len(mytgs)//10
+
 for day in trange(mydays[0],mydays[-1]+1, desc='Days     ', disable=disable_tqdm):
     dayloop_start = time.time()
     for tg in trange(mytgs[0],mytgs[-1]+1, desc='TimeGroup', disable=disable_tqdm):
+        # Zero the velstats
+        zero_velstats(nodes,edges)
+
         # Get velstats for this day, tg
         vdf_ = vdf[(vdf['day']==day) & (vdf['tg']==tg)]
         for idx, node in nodes.iterrows():
-            # Give this subset of vels, calc stats for each node
+            # Given this subset of vels, calc stats for each node
             vels = vdf_[vdf_['nodeID'] == idx]
-            nodes.at[idx,'ncar'] = len(vels.index)
-            if len(vels.index) == 0:
+            ncar = len(vels.index)
+            nodes.at[idx,'ncar'] = ncar
+            if ncar == 0:
                 continue
             nodes.at[idx,'v_avg'] = vels.mean(axis=0)['v']
-            if len(vels.index) > 1:
+            if ncar > 1:
                 nodes.at[idx,'v_std'] = vels.std(axis=0)['v']
         
             # Iterate over this nodes edges, adding vel stats as necessary
+            # Not that many edges for a given idx, so don't need to parallelize
             edges_ = edges[edges["sender"] == idx]
             for eidx, e in edges_.iterrows():
                 v_out, v_in = [], []
+                # Iterate over vels which belong to this node
                 for iv, v in vels.iterrows():
                     dtheta = v['angle'] - e['angle']
                     if (abs(dtheta) < 0.25*np.pi) | (abs(dtheta) > 1.75*np.pi):
@@ -247,32 +283,31 @@ for day in trange(mydays[0],mydays[-1]+1, desc='Days     ', disable=disable_tqdm
                     edges.at[eidx, "v_std_in"] = v_std_in
                     
         # Add to arrays
-        A = nodes[["ncar","v_avg","v_std"]].values.copy()
-        B = edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]].values.copy()
-        C = np.array([[day,tg]], dtype=np.int)
         h5_A = h5out["node_features/day"+str(day)+"tg"+str(tg)]
         h5_B = h5out["edge_features/day"+str(day)+"tg"+str(tg)]
         h5_C = h5out["glbl_features/day"+str(day)+"tg"+str(tg)]
-        h5_A[:] = A[:]
-        h5_B[:] = B[:]
-        h5_C[:] = C[:]
+        h5_A[:] = nodes[["ncar","v_avg","v_std"]].values
+        h5_B[:] = edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]].values
+        h5_C[:] = np.array([[day,tg]], dtype=np.int)
 
-
-    if disable_tqdm:
-        dayloop_end = time.time()
-        stdout("Day "+str(day)+" in "+str(dayloop_end - dayloop_start))
-        dyaloop_start = time.time()
         
 
-sys.stdout.flush()
+        # Print a diagnostic
+        if (mpirank==0) and not bdiag:
+            if tg == mytgs[tg_diag]:
+                stdout("Progress diagnostic:",mpirank)
+                stdout("Time to complete "+str(tg_diag)+" tgs (~10%) of "+str(len(mytgs)) \
+                    +": "+str((time.time() - dayloop_start)/60.)+" min",mpirank)
+                bdiag = True
+
 mpicomm.Barrier()
 
 global_end = time.time()
 if mpirank == 0:
     stdout("\nTotal time for main loop: "+str(global_end - tloop_start)+" s", mpirank)
     info_out.write("Total time for main loop: "+str(global_end - tloop_start)+" s"+"\n")
-    stdout("Total time for graphsnapper: "+str(time.time() - global_start)+" s", mpirank)
-    info_out.write("Total time for graphsnapper: "+str(global_end - tloop_start)+" s"+"\n")
+    stdout("Total time for graphsnapper: "+str(global_end - global_start)+" s", mpirank)
+    info_out.write("Total time for graphsnapper: "+str(global_end - global_start)+" s"+"\n")
     info_out.close()
 
 h5out.close()
