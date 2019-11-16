@@ -29,8 +29,6 @@ def add(h5dset, f5, df, tcutoff, minvel, silent=True):
     We assume df values for x,y are in the desired domain
     fname header: d tg x y vx vy v id
     '''
-        
-
     N = len(df.index)
     oldN = len(df.index)
     nmissed = 0 # filtered out paths
@@ -100,7 +98,7 @@ arglist = sys.argv[1:]
 tcutoff = 1.0
 velmin = 0.0
 runname = ""
-runpath = "/home/walterms/traffic/graphnn/veldata/"
+runpath = "/scratch/walterms/traffic/graphnn/veldata/"
 tglen = 10
 
 try:
@@ -111,7 +109,7 @@ except:
     sys.exit(2)
 
 for opt, arg in opts:
-    if opt in ("--timecutoff","-t"):
+    if opt in ("--tcutoff","-t"):
         tcutoff = float(arg)
         print("tcutoff "+str(tcutoff))
     elif opt in ("--velmin","-v"):
@@ -126,8 +124,6 @@ for opt, arg in opts:
     elif opt in ("--tglen", "-l"):
         tglen = int(arg)
         print("tglen "+str(tglen))
-
-
 
 # Fifth ring
 xmin = 116.1904 * long2km

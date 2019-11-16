@@ -24,8 +24,8 @@ arglen = len(sys.argv[1:])
 arglist = sys.argv[1:]
 
 runname = ""
-runpath = "/home/walterms/traffic/graphnn/veldata/"
-outpath = "/home/walterms/traffic/graphnn/nn_inputs/"
+runpath = "/scratch/walterms/traffic/graphnn/veldata/"
+outpath = "/scratch/walterms/traffic/graphnn/nn_inputs/"
 
 node_mindist = 0.05 # nodes closer than this will be eliminated for redundancy
 node_maxdist = 2.0
@@ -177,6 +177,29 @@ nsnap = 7*nTG
 # Make output hdf5 file
 h5out = h5py.File(outpath+runname+".hdf5", 'w', driver="mpio", comm=mpicomm) 
 h5out.atomic = True
+
+# Add info attributes
+for key,val in sorted(info.items()):
+    h5out.attrs[key] = val
+h5out.attrs['source'] = runpath+runname+".hdf5"
+h5out.attrs['node_mindist'] = node_mindist
+h5out.attrs['node_maxdist'] = node_maxdist
+h5out.attrs['maxnbr'] = maxnbr
+h5out.attrs['n_nodes'] = n_nodes
+h5out.attrs['n_edges'] = n_edges
+h5out.attrs['n_unique_vel'] = nvel
+h5out.attrs['nvel'] = len(vdf.index)
+h5out.attrs['node_feat_header'] = ['ncar','v_avg','v_std']
+h5out.attrs['edge_feat_header'] = ['ncar_out','v_avg_out','v_std_out','ncar_in','v_avg_in','v_std_in']
+h5out.attrs['glbl_feat_header'] = ['day','tg']
+# Rename these
+h5out.attrs['n_source_drivers_total'] = int(h5out.attrs['n_drivers'])
+h5out.attrs['n_source_vels'] = int(h5out.attrs['n_points'])
+mpicomm.Barrier()
+h5out.attrs.__delitem__('n_drivers')
+h5out.attrs.__delitem__('n_points')
+
+
 h5out.create_group("glbl_features")
 h5out.create_group("node_features")
 h5out.create_group("edge_features")
