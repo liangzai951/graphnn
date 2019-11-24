@@ -216,7 +216,6 @@ if mpirank==0:
 # Use ABC for shapes
 A = nodes[["ncar","v_avg","v_std"]].values.copy()
 B = edges[["ncar_out","v_avg_out","v_std_out","ncar_in","v_avg_in","v_std_in"]].values.copy()
-C = np.array([[0,0]], dtype=np.int)
 for day in range(7):
     for tg in range(nTG):
         h5out.create_dataset("node_features/day"+str(day)+"tg"+str(tg),
@@ -224,8 +223,8 @@ for day in range(7):
         h5out.create_dataset("edge_features/day"+str(day)+"tg"+str(tg),
                     B.shape, dtype=np.float)
         h5out.create_dataset("glbl_features/day"+str(day)+"tg"+str(tg),\
-                    C.shape, dtype=np.int)
-del A,B,C
+                    (1,2), dtype=np.int)
+del A,B
 
 # Need to figure out how to divy up the processors
 # accross the days and tgs
